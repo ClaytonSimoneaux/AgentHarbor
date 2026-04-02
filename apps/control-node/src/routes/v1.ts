@@ -1,20 +1,20 @@
 import type { Prisma } from "@prisma/client";
 import {
+  eventListQuerySchema,
   heartbeatRequestSchema,
   runnerEnrollmentRequestSchema,
+  runnerListQuerySchema,
   sessionDetailSchema,
+  sessionListQuerySchema,
   sessionStatuses,
   statsResponseSchema,
+  telemetryEventPayloadSchema,
   telemetryIngestRequestSchema,
 } from "@agentharbor/shared";
 import { z } from "zod";
 import { env } from "../env.js";
 import { authenticateRunner, issueRunnerToken } from "../lib/auth.js";
 import { prisma } from "../lib/prisma.js";
-
-const listQuerySchema = z.object({
-  limit: z.coerce.number().int().positive().max(100).optional(),
-});
 
 const parseTimestamp = (value: string) => new Date(value);
 
@@ -35,6 +35,145 @@ const sessionStatusFromEvent = (eventType: string) => {
 
 const isRunnerOnline = (lastSeenAt: Date | null) =>
   Boolean(lastSeenAt && Date.now() - lastSeenAt.getTime() <= env.runnerOnlineWindowMs);
+
+const normalizeRunnerStatus = (runner: { status: string; lastSeenAt: Date | null }) => {
+  if (isRunnerOnline(runner.lastSeenAt)) {
+    return "online";
+  }
+
+  if (runner.status === "enrolled") {
+    return "enrolled";
+  }
+
+  return "offline";
+};
+
+const includesSearch = (value: string | null | undefined, search: string) =>
+  Boolean(value?.toLowerCase().includes(search.toLowerCase()));
+
+type RunnerListRecord = {
+  id: string;
+  name: string;
+  machineName: string;
+  status: string;
+  labels: string[];
+  environment: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  lastSeenAt: Date | null;
+  machine: {
+    hostname: string;
+    os: string;
+    architecture: string;
+  };
+  _count: {
+    sessions: number;
+  };
+};
+
+type SessionListRecord = {
+  id: string;
+  runnerId: string;
+  agentType: string;
+  sessionKey: string;
+  status: string;
+  startedAt: Date;
+  endedAt: Date | null;
+  summary: string | null;
+  tokenUsage: number | null;
+  durationMs: number | null;
+  filesTouchedCount: number | null;
+  runner: {
+    name: string;
+  };
+  _count: {
+    telemetryEvents: number;
+  };
+};
+
+type SessionDetailRecord = {
+  id: string;
+  runnerId: string;
+  agentType: string;
+  sessionKey: string;
+  status: string;
+  startedAt: Date;
+  endedAt: Date | null;
+  summary: string | null;
+  tokenUsage: number | null;
+  durationMs: number | null;
+  filesTouchedCount: number | null;
+  runner: {
+    name: string;
+  };
+  telemetryEvents: Array<{
+    id: string;
+    runnerId: string;
+    sessionId: string | null;
+    eventType: string;
+    payloadJson: unknown;
+    createdAt: Date;
+  }>;
+};
+
+type EventListRecord = {
+  id: string;
+  runnerId: string;
+  sessionId: string | null;
+  eventType: string;
+  payloadJson: unknown;
+  createdAt: Date;
+  runner: {
+    name: string;
+  };
+  session: {
+    sessionKey: string;
+  } | null;
+};
+
+const serializeRunner = (runner: RunnerListRecord) => ({
+  id: runner.id,
+  name: runner.name,
+  machineName: runner.machineName,
+  hostname: runner.machine.hostname,
+  os: runner.machine.os,
+  architecture: runner.machine.architecture,
+  status: normalizeRunnerStatus(runner),
+  labels: runner.labels,
+  environment: runner.environment,
+  createdAt: runner.createdAt.toISOString(),
+  updatedAt: runner.updatedAt.toISOString(),
+  lastSeenAt: runner.lastSeenAt?.toISOString() ?? null,
+  isOnline: isRunnerOnline(runner.lastSeenAt),
+  activeSessionCount: runner._count.sessions,
+});
+
+const serializeSession = (session: SessionListRecord) => ({
+  id: session.id,
+  runnerId: session.runnerId,
+  runnerName: session.runner.name,
+  agentType: session.agentType,
+  sessionKey: session.sessionKey,
+  status: session.status,
+  startedAt: session.startedAt.toISOString(),
+  endedAt: session.endedAt?.toISOString() ?? null,
+  summary: session.summary,
+  tokenUsage: session.tokenUsage,
+  durationMs: session.durationMs,
+  filesTouchedCount: session.filesTouchedCount,
+  eventCount: session._count.telemetryEvents,
+});
+
+const serializeEvent = (event: EventListRecord) => ({
+  id: event.id,
+  runnerId: event.runnerId,
+  runnerName: event.runner.name,
+  sessionId: event.sessionId,
+  sessionKey: event.session?.sessionKey ?? null,
+  eventType: event.eventType,
+  payload: telemetryEventPayloadSchema.parse(event.payloadJson),
+  createdAt: event.createdAt.toISOString(),
+});
 
 const syncSessionForEvent = async (
   tx: Prisma.TransactionClient,
@@ -125,6 +264,8 @@ export const registerV1Routes = async (app: any) => {
         machineName: machine.hostname,
         machineId: machine.id,
         status: "enrolled",
+        labels: body.labels ?? [],
+        environment: body.environment ?? null,
         tokens: {
           create: {
             tokenHash: token.tokenHash,
@@ -140,6 +281,8 @@ export const registerV1Routes = async (app: any) => {
         name: runner.name,
         machineName: runner.machineName,
         status: runner.status,
+        labels: runner.labels,
+        environment: runner.environment,
         createdAt: runner.createdAt.toISOString(),
       },
       credentials: {
@@ -220,10 +363,16 @@ export const registerV1Routes = async (app: any) => {
   });
 
   app.get("/v1/runners", async (request: any) => {
-    const query = listQuerySchema.parse(request.query);
+    const query = runnerListQuerySchema.parse(request.query);
     const runners = await prisma.runner.findMany({
-      orderBy: { updatedAt: "desc" },
-      take: query.limit ?? 25,
+      where: query.label
+        ? {
+            labels: {
+              has: query.label,
+            },
+          }
+        : undefined,
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
       include: {
         machine: true,
         _count: {
@@ -238,25 +387,53 @@ export const registerV1Routes = async (app: any) => {
       },
     });
 
-    return runners.map((runner) => ({
-      id: runner.id,
-      name: runner.name,
-      machineName: runner.machineName,
-      hostname: runner.machine.hostname,
-      os: runner.machine.os,
-      architecture: runner.machine.architecture,
-      status: isRunnerOnline(runner.lastSeenAt) ? "online" : runner.status === "enrolled" ? "enrolled" : "offline",
-      createdAt: runner.createdAt.toISOString(),
-      updatedAt: runner.updatedAt.toISOString(),
-      lastSeenAt: runner.lastSeenAt?.toISOString() ?? null,
-      isOnline: isRunnerOnline(runner.lastSeenAt),
-      activeSessionCount: runner._count.sessions,
-    }));
+    const filteredRunners = runners
+      .map((runner) => serializeRunner(runner as RunnerListRecord))
+      .filter((runner) => {
+        const search = query.search;
+
+        if (query.status && runner.status !== query.status) {
+          return false;
+        }
+
+        if (search) {
+          return (
+            includesSearch(runner.name, search) ||
+            includesSearch(runner.machineName, search) ||
+            includesSearch(runner.hostname, search) ||
+            includesSearch(runner.os, search) ||
+            includesSearch(runner.architecture, search) ||
+            includesSearch(runner.environment, search) ||
+            runner.labels.some((label) => includesSearch(label, search))
+          );
+        }
+
+        return true;
+      });
+
+    return filteredRunners.slice(0, query.limit ?? 25);
   });
 
   app.get("/v1/sessions", async (request: any) => {
-    const query = listQuerySchema.parse(request.query);
+    const query = sessionListQuerySchema.parse(request.query);
+    const where: Prisma.AgentSessionWhereInput = {
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.agentType ? { agentType: query.agentType } : {}),
+      ...(query.runnerId ? { runnerId: query.runnerId } : {}),
+      ...(query.since ? { startedAt: { gte: new Date(query.since) } } : {}),
+      ...(query.search
+        ? {
+            OR: [
+              { sessionKey: { contains: query.search, mode: "insensitive" } },
+              { summary: { contains: query.search, mode: "insensitive" } },
+              { runner: { is: { name: { contains: query.search, mode: "insensitive" } } } },
+            ],
+          }
+        : {}),
+    };
+
     const sessions = await prisma.agentSession.findMany({
+      where,
       orderBy: { startedAt: "desc" },
       take: query.limit ?? 25,
       include: {
@@ -269,21 +446,7 @@ export const registerV1Routes = async (app: any) => {
       },
     });
 
-    return sessions.map((session) => ({
-      id: session.id,
-      runnerId: session.runnerId,
-      runnerName: session.runner.name,
-      agentType: session.agentType,
-      sessionKey: session.sessionKey,
-      status: session.status,
-      startedAt: session.startedAt.toISOString(),
-      endedAt: session.endedAt?.toISOString() ?? null,
-      summary: session.summary,
-      tokenUsage: session.tokenUsage,
-      durationMs: session.durationMs,
-      filesTouchedCount: session.filesTouchedCount,
-      eventCount: session._count.telemetryEvents,
-    }));
+    return sessions.map((session) => serializeSession(session as SessionListRecord));
   });
 
   app.get("/v1/sessions/:id", async (request: any, reply: any) => {
@@ -302,28 +465,29 @@ export const registerV1Routes = async (app: any) => {
       return reply.code(404).send({ error: "Session not found" });
     }
 
+    const detail = session as unknown as SessionDetailRecord;
     const payload = {
-      id: session.id,
-      runnerId: session.runnerId,
-      runnerName: session.runner.name,
-      agentType: session.agentType,
-      sessionKey: session.sessionKey,
-      status: session.status,
-      startedAt: session.startedAt.toISOString(),
-      endedAt: session.endedAt?.toISOString() ?? null,
-      summary: session.summary,
-      tokenUsage: session.tokenUsage,
-      durationMs: session.durationMs,
-      filesTouchedCount: session.filesTouchedCount,
-      eventCount: session.telemetryEvents.length,
-      events: session.telemetryEvents.map((event) => ({
+      id: detail.id,
+      runnerId: detail.runnerId,
+      runnerName: detail.runner.name,
+      agentType: detail.agentType,
+      sessionKey: detail.sessionKey,
+      status: detail.status,
+      startedAt: detail.startedAt.toISOString(),
+      endedAt: detail.endedAt?.toISOString() ?? null,
+      summary: detail.summary,
+      tokenUsage: detail.tokenUsage,
+      durationMs: detail.durationMs,
+      filesTouchedCount: detail.filesTouchedCount,
+      eventCount: detail.telemetryEvents.length,
+      events: detail.telemetryEvents.map((event) => ({
         id: event.id,
         runnerId: event.runnerId,
-        runnerName: session.runner.name,
+        runnerName: detail.runner.name,
         sessionId: event.sessionId,
-        sessionKey: session.sessionKey,
+        sessionKey: detail.sessionKey,
         eventType: event.eventType,
-        payload: event.payloadJson,
+        payload: telemetryEventPayloadSchema.parse(event.payloadJson),
         createdAt: event.createdAt.toISOString(),
       })),
     };
@@ -332,26 +496,43 @@ export const registerV1Routes = async (app: any) => {
   });
 
   app.get("/v1/events", async (request: any) => {
-    const query = listQuerySchema.parse(request.query);
+    const query = eventListQuerySchema.parse(request.query);
     const events = await prisma.telemetryEvent.findMany({
-      orderBy: { createdAt: "desc" },
-      take: query.limit ?? 50,
+      where: {
+        ...(query.eventType ? { eventType: query.eventType } : {}),
+        ...(query.runnerId ? { runnerId: query.runnerId } : {}),
+        ...(query.sessionId ? { sessionId: query.sessionId } : {}),
+        ...(query.since ? { createdAt: { gte: new Date(query.since) } } : {}),
+      },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: query.search || query.agentType ? 250 : query.limit ?? 50,
       include: {
         runner: true,
         session: true,
       },
     });
 
-    return events.map((event) => ({
-      id: event.id,
-      runnerId: event.runnerId,
-      runnerName: event.runner.name,
-      sessionId: event.sessionId,
-      sessionKey: event.session?.sessionKey ?? null,
-      eventType: event.eventType,
-      payload: event.payloadJson,
-      createdAt: event.createdAt.toISOString(),
-    }));
+    const filteredEvents = events
+      .map((event) => serializeEvent(event as unknown as EventListRecord))
+      .filter((event) => {
+        if (query.agentType && event.payload.agentType !== query.agentType) {
+          return false;
+        }
+
+        if (query.search) {
+          return (
+            includesSearch(event.eventType, query.search) ||
+            includesSearch(event.runnerName, query.search) ||
+            includesSearch(event.sessionKey, query.search) ||
+            includesSearch(event.payload.summary, query.search) ||
+            includesSearch(event.payload.category ?? null, query.search)
+          );
+        }
+
+        return true;
+      });
+
+    return filteredEvents.slice(0, query.limit ?? 50);
   });
 
   app.get("/v1/stats", async () => {

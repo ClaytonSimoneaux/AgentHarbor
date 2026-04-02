@@ -3,6 +3,19 @@ import { z } from "zod";
 export const agentTypes = ["codex", "claude-code", "cursor", "automation", "custom"] as const;
 export type AgentType = (typeof agentTypes)[number];
 
+export const eventCategories = [
+  "session",
+  "planning",
+  "implementation",
+  "build",
+  "test",
+  "network",
+  "auth",
+  "failure",
+  "recovery",
+] as const;
+export type EventCategory = (typeof eventCategories)[number];
+
 export const telemetryEventTypes = [
   "runner.heartbeat",
   "agent.session.started",
@@ -19,6 +32,19 @@ export type RunnerStatus = (typeof runnerStatuses)[number];
 export const sessionStatuses = ["running", "completed", "failed"] as const;
 export type SessionStatus = (typeof sessionStatuses)[number];
 
+export const runnerLabelSchema = z.string().trim().min(1).max(64);
+export const runnerEnvironmentSchema = z.string().trim().min(1).max(64);
+
+const limitQuerySchema = z.coerce.number().int().positive().max(100).optional();
+const optionalQueryStringSchema = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().trim().min(1).optional(),
+);
+const optionalDateTimeQuerySchema = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().datetime().optional(),
+);
+
 export const machineDescriptorSchema = z.object({
   hostname: z.string().min(1),
   os: z.string().min(1),
@@ -28,7 +54,8 @@ export const machineDescriptorSchema = z.object({
 export const runnerEnrollmentRequestSchema = z.object({
   runnerName: z.string().min(2),
   machine: machineDescriptorSchema,
-  labels: z.array(z.string()).optional(),
+  labels: z.array(runnerLabelSchema).optional(),
+  environment: runnerEnvironmentSchema.optional(),
 });
 export type RunnerEnrollmentRequest = z.infer<typeof runnerEnrollmentRequestSchema>;
 
@@ -45,6 +72,8 @@ export const runnerEnrollmentResponseSchema = z.object({
     name: z.string(),
     machineName: z.string(),
     status: z.enum(runnerStatuses),
+    labels: z.array(runnerLabelSchema),
+    environment: runnerEnvironmentSchema.nullable(),
     createdAt: z.string(),
   }),
   credentials: runnerTokenResponseSchema,
@@ -56,7 +85,7 @@ export const telemetryEventPayloadSchema = z.object({
   agentType: z.enum(agentTypes),
   sessionKey: z.string().min(1).optional(),
   summary: z.string().max(2_000).optional(),
-  category: z.string().max(120).optional(),
+  category: z.enum(eventCategories).optional(),
   durationMs: z.number().int().nonnegative().optional(),
   tokenUsage: z.number().int().nonnegative().optional(),
   filesTouchedCount: z.number().int().nonnegative().optional(),
@@ -93,6 +122,35 @@ export const statsResponseSchema = z.object({
 });
 export type StatsResponse = z.infer<typeof statsResponseSchema>;
 
+export const runnerListQuerySchema = z.object({
+  limit: limitQuerySchema,
+  status: z.enum(runnerStatuses).optional(),
+  label: runnerLabelSchema.optional(),
+  search: optionalQueryStringSchema,
+});
+export type RunnerListQuery = z.infer<typeof runnerListQuerySchema>;
+
+export const sessionListQuerySchema = z.object({
+  limit: limitQuerySchema,
+  status: z.enum(sessionStatuses).optional(),
+  agentType: z.enum(agentTypes).optional(),
+  runnerId: optionalQueryStringSchema,
+  since: optionalDateTimeQuerySchema,
+  search: optionalQueryStringSchema,
+});
+export type SessionListQuery = z.infer<typeof sessionListQuerySchema>;
+
+export const eventListQuerySchema = z.object({
+  limit: limitQuerySchema,
+  eventType: z.enum(telemetryEventTypes).optional(),
+  agentType: z.enum(agentTypes).optional(),
+  runnerId: optionalQueryStringSchema,
+  sessionId: optionalQueryStringSchema,
+  since: optionalDateTimeQuerySchema,
+  search: optionalQueryStringSchema,
+});
+export type EventListQuery = z.infer<typeof eventListQuerySchema>;
+
 export const runnerListItemSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -101,6 +159,8 @@ export const runnerListItemSchema = z.object({
   os: z.string(),
   architecture: z.string(),
   status: z.enum(runnerStatuses),
+  labels: z.array(runnerLabelSchema),
+  environment: runnerEnvironmentSchema.nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
   lastSeenAt: z.string().nullable(),

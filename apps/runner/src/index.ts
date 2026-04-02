@@ -3,9 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Command } from "commander";
-import { parseBoolean } from "@agentharbor/config";
 import { AgentHarborClient } from "@agentharbor/sdk";
-import { TelemetryEventEnvelope, telemetryEventTypes } from "@agentharbor/shared";
+import { type TelemetryEventEnvelope, telemetryEventTypes } from "@agentharbor/shared";
 
 interface RunnerConfig {
   controlNodeUrl: string;
@@ -20,10 +19,40 @@ interface RunnerConfig {
   };
 }
 
+type DemoScenarioName = "happy-path" | "failure-burst";
+type DemoAgentType = "codex" | "claude-code" | "cursor" | "automation";
+type FailureCategory = "build" | "test" | "network" | "auth" | "failure";
+
+interface DemoRunnerContext {
+  runnerId: string;
+  runnerName: string;
+  token: string;
+  agentType: DemoAgentType;
+  client: AgentHarborClient;
+  activeSessionCount: number;
+}
+
 const configDirectory = path.join(os.homedir(), ".agentharbor");
 const configPath = path.join(configDirectory, "runner.json");
+const demoScenarioNames = ["happy-path", "failure-burst"] as const;
+const demoAgentTypes = ["codex", "claude-code", "cursor", "automation"] as const;
+const failureCategories = ["build", "test", "network", "auth", "failure"] as const;
 
 const sleep = (durationMs: number) => new Promise((resolve) => setTimeout(resolve, durationMs));
+
+const sleepWithSignal = (durationMs: number, signal: AbortSignal) =>
+  new Promise<void>((resolve) => {
+    const onDone = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onDone);
+      resolve();
+    };
+
+    const timeout = setTimeout(onDone, durationMs);
+    signal.addEventListener("abort", onDone, { once: true });
+  });
+
+const collectOptionValues = (value: string, previous: string[]) => [...previous, value.trim()].filter(Boolean);
 
 const readConfig = async (): Promise<RunnerConfig> => {
   const raw = await fs.readFile(configPath, "utf8");
@@ -41,12 +70,27 @@ const defaultMachine = () => ({
   architecture: os.arch(),
 });
 
+const createClient = ({
+  controlNodeUrl,
+  allowSelfSigned,
+  runnerToken,
+}: {
+  controlNodeUrl: string;
+  allowSelfSigned: boolean;
+  runnerToken?: string;
+}) =>
+  new AgentHarborClient({
+    baseUrl: controlNodeUrl,
+    allowSelfSigned,
+    runnerToken,
+  });
+
 const getClientFromConfig = async () => {
   const config = await readConfig();
   return {
     config,
-    client: new AgentHarborClient({
-      baseUrl: config.controlNodeUrl,
+    client: createClient({
+      controlNodeUrl: config.controlNodeUrl,
       allowSelfSigned: config.allowSelfSigned,
       runnerToken: config.token,
     }),
@@ -67,6 +111,330 @@ const buildEvent = (
   },
 });
 
+const ensurePositiveNumber = (value: string, optionName: string) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${optionName} must be a positive number`);
+  }
+
+  return parsed;
+};
+
+const parseScenarioName = (value: string): DemoScenarioName => {
+  if ((demoScenarioNames as readonly string[]).includes(value)) {
+    return value as DemoScenarioName;
+  }
+
+  throw new Error(`Unsupported demo scenario: ${value}`);
+};
+
+const parseAgentTypeOption = (value: string): DemoAgentType | "mixed" => {
+  if (value === "mixed") {
+    return value;
+  }
+
+  if ((demoAgentTypes as readonly string[]).includes(value)) {
+    return value as DemoAgentType;
+  }
+
+  throw new Error(`Unsupported agent type: ${value}`);
+};
+
+const resolveDemoAgentTypes = (agentTypeOption: DemoAgentType | "mixed", runnerCount: number): DemoAgentType[] => {
+  if (agentTypeOption !== "mixed") {
+    return Array.from({ length: runnerCount }, () => agentTypeOption);
+  }
+
+  return Array.from({ length: runnerCount }, (_, index) => demoAgentTypes[index % demoAgentTypes.length]);
+};
+
+const buildDemoRunnerName = (baseRunnerName: string, agentType: DemoAgentType, index: number) =>
+  `${baseRunnerName}-${agentType}-${index + 1}`;
+
+const buildSessionKey = (runnerName: string, scenario: DemoScenarioName, cycle: number) =>
+  `${runnerName}-${scenario}-${cycle + 1}-${randomUUID().slice(0, 8)}`;
+
+const failureCategoryFor = (cycle: number, runnerIndex: number): FailureCategory =>
+  failureCategories[(cycle + runnerIndex) % failureCategories.length];
+
+const failureSummaryFor = (category: FailureCategory) => {
+  switch (category) {
+    case "build":
+      return "Encountered repeated build failures while applying the patch.";
+    case "test":
+      return "Unit tests kept failing after multiple implementation attempts.";
+    case "network":
+      return "Dependency fetches timed out while preparing the workspace.";
+    case "auth":
+      return "Authentication to a required service failed during execution.";
+    default:
+      return "The agent exhausted its retries and could not complete the task.";
+  }
+};
+
+const startHeartbeatLoop = async ({
+  client,
+  intervalMs,
+  getActiveSessionCount,
+  metadata,
+}: {
+  client: AgentHarborClient;
+  intervalMs: number;
+  getActiveSessionCount: () => number;
+  metadata?: Record<string, string | number | boolean | null>;
+}) => {
+  const controller = new AbortController();
+  let delayMs = intervalMs;
+
+  const task = (async () => {
+    while (!controller.signal.aborted) {
+      try {
+        await client.sendHeartbeat({
+          timestamp: nowIso(),
+          activeSessionCount: getActiveSessionCount(),
+          metadata,
+        });
+        delayMs = intervalMs;
+      } catch (error) {
+        console.error(`Heartbeat loop error: ${error instanceof Error ? error.message : String(error)}`);
+        delayMs = Math.min(delayMs * 2, 60_000);
+      }
+
+      await sleepWithSignal(delayMs, controller.signal);
+    }
+  })();
+
+  return async () => {
+    controller.abort();
+    await task;
+  };
+};
+
+const waitForShutdownSignal = (stop: () => Promise<void>) =>
+  new Promise<void>((resolve, reject) => {
+    let stopping = false;
+
+    const shutdown = async () => {
+      if (stopping) {
+        return;
+      }
+
+      stopping = true;
+
+      try {
+        await stop();
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    };
+
+    process.once("SIGINT", () => void shutdown());
+    process.once("SIGTERM", () => void shutdown());
+  });
+
+const enrollDemoRunner = async ({
+  controlNodeUrl,
+  allowSelfSigned,
+  baseRunnerName,
+  agentType,
+  runnerIndex,
+  scenario,
+}: {
+  controlNodeUrl: string;
+  allowSelfSigned: boolean;
+  baseRunnerName: string;
+  agentType: DemoAgentType;
+  runnerIndex: number;
+  scenario: DemoScenarioName;
+}) => {
+  const bootstrapClient = createClient({ controlNodeUrl, allowSelfSigned });
+  const machine = defaultMachine();
+  const runnerName = buildDemoRunnerName(baseRunnerName, agentType, runnerIndex);
+  const response = await bootstrapClient.enrollRunner({
+    runnerName,
+    labels: ["demo", scenario, agentType],
+    environment: "demo",
+    machine: {
+      hostname: `${machine.hostname}-demo-${runnerIndex + 1}`,
+      os: machine.os,
+      architecture: machine.architecture,
+    },
+  });
+
+  return {
+    runnerId: response.runner.id,
+    runnerName: response.runner.name,
+    token: response.credentials.token,
+    agentType,
+    activeSessionCount: 0,
+    client: createClient({
+      controlNodeUrl,
+      allowSelfSigned,
+      runnerToken: response.credentials.token,
+    }),
+  } satisfies DemoRunnerContext;
+};
+
+const runHappyPathCycle = async (context: DemoRunnerContext, cycle: number, intervalMs: number, scenario: DemoScenarioName) => {
+  const sessionKey = buildSessionKey(context.runnerName, scenario, cycle);
+  const start = Date.now();
+
+  context.activeSessionCount = 1;
+
+  try {
+    await context.client.startSession(
+      buildEvent("agent.session.started", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: "Accepted a coding task and initialized workspace context.",
+        category: "session",
+        status: "running",
+      }),
+    );
+    await sleep(intervalMs);
+
+    await context.client.sendTelemetryEvent(
+      buildEvent("agent.prompt.executed", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: "Generated a structured implementation plan after reading repo state.",
+        category: "planning",
+        tokenUsage: 620 + cycle * 45,
+        filesTouchedCount: 2 + cycle,
+        status: "in-progress",
+      }),
+    );
+    await sleep(intervalMs);
+
+    await context.client.sendTelemetryEvent(
+      buildEvent("agent.summary.updated", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: "Control node filters, labels, and demo telemetry are wired together.",
+        category: "implementation",
+        tokenUsage: 1_250 + cycle * 60,
+        filesTouchedCount: 8 + cycle,
+        status: "in-progress",
+      }),
+    );
+    await sleep(intervalMs);
+
+    await context.client.completeSession(
+      buildEvent("agent.session.completed", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: "Demo session completed successfully.",
+        category: "session",
+        durationMs: Date.now() - start,
+        tokenUsage: 1_800 + cycle * 80,
+        filesTouchedCount: 11 + cycle,
+        status: "completed",
+      }),
+    );
+  } finally {
+    context.activeSessionCount = 0;
+  }
+
+  console.log(`[${context.runnerName}] Completed happy-path cycle ${cycle + 1}`);
+};
+
+const runFailureBurstCycle = async (
+  context: DemoRunnerContext,
+  cycle: number,
+  intervalMs: number,
+  scenario: DemoScenarioName,
+  runnerIndex: number,
+) => {
+  const sessionKey = buildSessionKey(context.runnerName, scenario, cycle);
+  const start = Date.now();
+  const failureCategory = failureCategoryFor(cycle, runnerIndex);
+
+  context.activeSessionCount = 1;
+
+  try {
+    await context.client.startSession(
+      buildEvent("agent.session.started", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: "Accepted a coding task and initialized workspace context.",
+        category: "session",
+        status: "running",
+      }),
+    );
+    await sleep(intervalMs);
+
+    await context.client.sendTelemetryEvent(
+      buildEvent("agent.prompt.executed", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: failureSummaryFor(failureCategory),
+        category: failureCategory,
+        tokenUsage: 980 + cycle * 30,
+        filesTouchedCount: 4 + cycle,
+        status: "blocked",
+      }),
+    );
+    await sleep(intervalMs);
+
+    await context.client.sendTelemetryEvent(
+      buildEvent("agent.summary.updated", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: "The runner retried twice but could not recover from the failure condition.",
+        category: "failure",
+        tokenUsage: 1_240 + cycle * 40,
+        filesTouchedCount: 5 + cycle,
+        status: "retrying",
+      }),
+    );
+    await sleep(intervalMs);
+
+    await context.client.sendTelemetryEvent(
+      buildEvent("agent.session.failed", {
+        agentType: context.agentType,
+        sessionKey,
+        summary: `Session failed after repeated ${failureCategory} issues.`,
+        category: "failure",
+        durationMs: Date.now() - start,
+        tokenUsage: 1_450 + cycle * 55,
+        filesTouchedCount: 6 + cycle,
+        status: "failed",
+      }),
+    );
+  } finally {
+    context.activeSessionCount = 0;
+  }
+
+  console.log(`[${context.runnerName}] Completed failure-burst cycle ${cycle + 1}`);
+};
+
+const runDemoScenario = async ({
+  context,
+  scenario,
+  cycles,
+  intervalMs,
+  runnerIndex,
+}: {
+  context: DemoRunnerContext;
+  scenario: DemoScenarioName;
+  cycles: number;
+  intervalMs: number;
+  runnerIndex: number;
+}) => {
+  await sleep(runnerIndex * Math.max(150, Math.floor(intervalMs / 2)));
+
+  for (let cycle = 0; cycle < cycles; cycle += 1) {
+    if (scenario === "failure-burst") {
+      await runFailureBurstCycle(context, cycle, intervalMs, scenario, runnerIndex);
+    } else {
+      await runHappyPathCycle(context, cycle, intervalMs, scenario);
+    }
+
+    await sleep(intervalMs);
+  }
+};
+
 const program = new Command();
 program.name("agentharbor").description("Runner CLI for AgentHarbor").version("0.1.0");
 
@@ -77,15 +445,19 @@ program
   .option("--hostname <hostname>", "Machine hostname", os.hostname())
   .option("--os <os>", "Machine OS", `${os.platform()} ${os.release()}`)
   .option("--arch <arch>", "Machine architecture", os.arch())
+  .option("--label <label>", "Runner label (repeatable)", collectOptionValues, [] as string[])
+  .option("--environment <environment>", "Runner environment")
   .option("--allow-self-signed", "Trust self-signed TLS certificates", false)
   .action(async (options) => {
-    const client = new AgentHarborClient({
-      baseUrl: options.url,
+    const client = createClient({
+      controlNodeUrl: options.url,
       allowSelfSigned: options.allowSelfSigned,
     });
 
     const response = await client.enrollRunner({
       runnerName: options.name,
+      labels: options.label,
+      environment: options.environment,
       machine: {
         hostname: options.hostname,
         os: options.os,
@@ -125,6 +497,28 @@ program.command("heartbeat").action(async () => {
 });
 
 program
+  .command("heartbeat-loop")
+  .option("--interval-ms <intervalMs>", "Delay between heartbeats", "10000")
+  .action(async (options) => {
+    const intervalMs = ensurePositiveNumber(options.intervalMs, "interval-ms");
+    const { client, config } = await getClientFromConfig();
+    const stop = await startHeartbeatLoop({
+      client,
+      intervalMs,
+      getActiveSessionCount: () => 0,
+      metadata: {
+        hostname: defaultMachine().hostname,
+        mode: "daemon",
+        runnerId: config.runnerId,
+      },
+    });
+
+    console.log(`Heartbeat loop started for ${config.runnerName}. Press Ctrl+C to stop.`);
+    await waitForShutdownSignal(stop);
+    console.log("Heartbeat loop stopped");
+  });
+
+program
   .command("send-event")
   .argument("<eventType>", `One of: ${telemetryEventTypes.join(", ")}`)
   .option("--agent-type <agentType>", "Agent type", "custom")
@@ -159,80 +553,68 @@ program
 
 program
   .command("demo")
-  .option("--agent-type <agentType>", "Agent type to simulate", "codex")
-  .option("--cycles <cycles>", "Number of demo sessions", "3")
-  .option("--interval-ms <intervalMs>", "Delay between events", "1500")
+  .option("--scenario <scenario>", `Demo scenario (${demoScenarioNames.join(", ")})`, "happy-path")
+  .option("--agent-type <agentType>", "Agent type to simulate or 'mixed'", "mixed")
+  .option("--runners <runners>", "Number of demo runners", "1")
+  .option("--cycles <cycles>", "Number of demo sessions per runner", "3")
+  .option("--interval-ms <intervalMs>", "Delay between scenario events", "1500")
+  .option("--heartbeat-interval-ms <heartbeatIntervalMs>", "Delay between automatic heartbeats", "10000")
   .action(async (options) => {
-    const { client, config } = await getClientFromConfig();
-    const cycles = Number(options.cycles);
-    const intervalMs = Number(options.intervalMs);
+    const { config } = await getClientFromConfig();
+    const scenario = parseScenarioName(options.scenario);
+    const agentTypeOption = parseAgentTypeOption(options.agentType);
+    const runnerCount = ensurePositiveNumber(options.runners, "runners");
+    const cycles = ensurePositiveNumber(options.cycles, "cycles");
+    const intervalMs = ensurePositiveNumber(options.intervalMs, "interval-ms");
+    const heartbeatIntervalMs = ensurePositiveNumber(options.heartbeatIntervalMs, "heartbeat-interval-ms");
+    const agentTypes = resolveDemoAgentTypes(agentTypeOption, runnerCount);
 
-    for (let index = 0; index < cycles; index += 1) {
-      const sessionKey = `${config.runnerName}-${options.agentType}-${randomUUID().slice(0, 8)}`;
-      const start = Date.now();
-
-      await client.sendHeartbeat({
-        timestamp: nowIso(),
-        activeSessionCount: 1,
-        metadata: {
-          mode: "demo",
-          runnerId: config.runnerId,
-        },
-      });
-
-      await client.startSession(
-        buildEvent("agent.session.started", {
-          agentType: options.agentType,
-          sessionKey,
-          summary: "Accepted a coding task and initialized workspace context.",
-          category: "session",
-          status: "running",
+    const contexts = await Promise.all(
+      agentTypes.map((agentType, runnerIndex) =>
+        enrollDemoRunner({
+          controlNodeUrl: config.controlNodeUrl,
+          allowSelfSigned: config.allowSelfSigned,
+          baseRunnerName: config.runnerName,
+          agentType,
+          runnerIndex,
+          scenario,
         }),
-      );
-      await sleep(intervalMs);
+      ),
+    );
 
-      await client.sendTelemetryEvent(
-        buildEvent("agent.prompt.executed", {
-          agentType: options.agentType,
-          sessionKey,
-          summary: "Generated a structured implementation plan after reading repo state.",
-          category: "planning",
-          tokenUsage: 620,
-          filesTouchedCount: 2,
-          status: "in-progress",
+    const stopHeartbeatLoops = await Promise.all(
+      contexts.map((context) =>
+        startHeartbeatLoop({
+          client: context.client,
+          intervalMs: heartbeatIntervalMs,
+          getActiveSessionCount: () => context.activeSessionCount,
+          metadata: {
+            mode: "demo",
+            scenario,
+            runnerId: context.runnerId,
+            agentType: context.agentType,
+          },
         }),
-      );
-      await sleep(intervalMs);
+      ),
+    );
 
-      await client.sendTelemetryEvent(
-        buildEvent("agent.summary.updated", {
-          agentType: options.agentType,
-          sessionKey,
-          summary: "Control node API, dashboard metrics, and runner telemetry all wired together.",
-          category: "implementation",
-          tokenUsage: 1250,
-          filesTouchedCount: 8,
-          status: "in-progress",
-        }),
+    try {
+      await Promise.all(
+        contexts.map((context, runnerIndex) =>
+          runDemoScenario({
+            context,
+            scenario,
+            cycles,
+            intervalMs,
+            runnerIndex,
+          }),
+        ),
       );
-      await sleep(intervalMs);
-
-      await client.completeSession(
-        buildEvent("agent.session.completed", {
-          agentType: options.agentType,
-          sessionKey,
-          summary: "Demo session completed successfully.",
-          category: "session",
-          durationMs: Date.now() - start,
-          tokenUsage: 1800,
-          filesTouchedCount: 11,
-          status: "completed",
-        }),
-      );
-
-      console.log(`Completed demo cycle ${index + 1}/${cycles} for ${sessionKey}`);
-      await sleep(intervalMs);
+    } finally {
+      await Promise.all(stopHeartbeatLoops.map((stop) => stop()));
     }
+
+    console.log(`Completed ${scenario} demo with ${runnerCount} runner(s) across ${cycles} cycle(s).`);
   });
 
 program.command("show-config").action(async () => {
