@@ -12,6 +12,7 @@
     "db:generate": "pnpm --filter @agentharbor/control-node prisma generate",
     "db:push": "pnpm --filter @agentharbor/control-node prisma db push",
     "lint": "pnpm -r --filter './packages/**' --filter './apps/**' lint",
+    "test:control": "pnpm --filter @agentharbor/control-node test",
     "typecheck": "pnpm -r --filter './packages/**' --filter './apps/**' typecheck"
   },
   "devDependencies": {

@@ -104,6 +104,8 @@ cd apps/runner
 node dist/index.js enroll \
   --url https://localhost:8443 \
   --name my-laptop \
+  --label demo \
+  --environment demo \
   --allow-self-signed
 ```
 
@@ -116,13 +118,39 @@ cd apps/runner
 node dist/index.js heartbeat
 ```
 
-## Demo flow
-
-Simulate Codex activity and populate the dashboard:
+Run an automatic heartbeat loop:
 
 ```bash
 cd apps/runner
-node dist/index.js demo --cycles 3 --interval-ms 500 --agent-type codex
+node dist/index.js heartbeat-loop --interval-ms 10000
+```
+
+## Demo flow
+
+Simulate successful multi-runner activity and populate the dashboard:
+
+```bash
+cd apps/runner
+node dist/index.js demo \
+  --scenario happy-path \
+  --agent-type mixed \
+  --runners 4 \
+  --cycles 3 \
+  --interval-ms 1200 \
+  --heartbeat-interval-ms 8000
+```
+
+Simulate a failure-heavy burst:
+
+```bash
+cd apps/runner
+node dist/index.js demo \
+  --scenario failure-burst \
+  --agent-type mixed \
+  --runners 4 \
+  --cycles 2 \
+  --interval-ms 1200 \
+  --heartbeat-interval-ms 8000
 ```
 
 This emits:
@@ -132,6 +160,9 @@ This emits:
 - `agent.prompt.executed`
 - `agent.summary.updated`
 - `agent.session.completed`
+- `agent.session.failed`
+
+See [backend-contract.md](./backend-contract.md) for the current backend/frontend handoff contract, supported filters, and example queries.
 
 ## API surface
 
@@ -154,6 +185,7 @@ This emits:
 - `pnpm dev:runner`
 - `pnpm db:generate`
 - `pnpm db:push`
+- `pnpm test:control`
 
 ## Security baseline
 

@@ -35,6 +35,8 @@ model Runner {
   name           String
   machineName    String
   status         RunnerStatus     @default(enrolled)
+  labels         String[]         @default([])
+  environment    String?
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
   lastSeenAt     DateTime?
@@ -46,6 +48,7 @@ model Runner {
 
   @@index([machineId])
   @@index([lastSeenAt])
+  @@index([status, updatedAt])
 }
 
 model RunnerToken {
