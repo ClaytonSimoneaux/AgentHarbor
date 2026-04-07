@@ -12,15 +12,21 @@ export const platformToDemoLabel = (platform: NodeJS.Platform) =>
 export const buildDemoRunnerLabels = ({
   platform,
   runnerIndex,
+  scenario,
+  agentType,
 }: {
   platform: NodeJS.Platform;
   runnerIndex: number;
+  scenario: string;
+  agentType: string;
 }) => {
   const labels = new Set<string>([
     "demo",
     "backend",
     platformToDemoLabel(platform),
     demoTeamLabels[runnerIndex % demoTeamLabels.length],
+    scenario,
+    agentType,
   ]);
 
   if (runnerIndex % 2 === 0) {

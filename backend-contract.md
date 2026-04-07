@@ -131,6 +131,7 @@ Response fields the frontend can rely on:
 ### `POST /v1/runners/:id/revoke-tokens`
 
 Revokes all active tokens for a runner. Future heartbeat and telemetry requests using those tokens return `401`.
+Requires `Authorization: Bearer <CONTROL_NODE_ADMIN_TOKEN>`.
 
 Response:
 
@@ -288,7 +289,7 @@ The frontend can assume:
 - completed sessions will carry `status: "completed"`
 - failure scenarios use structured categories instead of free-form strings
 - demo runners will carry the `demo` label and `environment: "demo"`
-- demo grouping labels will include stable values like `backend`, `student-team-a`, `student-team-b`, and the host platform label
+- demo grouping labels will include stable values like `backend`, `student-team-a`, `student-team-b`, and the host platform label while still retaining the scenario and agent-type labels used by the existing demo filters
 - runner label groups can be rendered directly from `GET /v1/runners/groups`
 - multi-runner traffic can be generated from one command without manual event entry
 - the dashboard can subscribe to `GET /v1/stream/events` once and refresh snapshots when stream events arrive

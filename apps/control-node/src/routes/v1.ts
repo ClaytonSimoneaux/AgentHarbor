@@ -20,7 +20,7 @@ import {
 } from "@agentharbor/shared";
 import { z } from "zod";
 import { env } from "../env.js";
-import { authenticateRunner, issueRunnerToken } from "../lib/auth.js";
+import { authenticateAdminRequest, authenticateRunner, issueRunnerToken } from "../lib/auth.js";
 import { prisma } from "../lib/prisma.js";
 import { formatServerSentEvent, publishStreamEvent, subscribeStream } from "../lib/stream.js";
 
@@ -106,28 +106,6 @@ const buildRunnerListWhere = (query: {
     runnerFilters.push({
       ...notOnlineWhere,
       status: { not: "enrolled" },
-    });
-  }
-
-  if (query.search) {
-    runnerFilters.push({
-      OR: [
-        { name: { contains: query.search, mode: "insensitive" } },
-        { machineName: { contains: query.search, mode: "insensitive" } },
-        { environment: { contains: query.search, mode: "insensitive" } },
-        { labels: { has: query.search } },
-        {
-          machine: {
-            is: {
-              OR: [
-                { hostname: { contains: query.search, mode: "insensitive" } },
-                { os: { contains: query.search, mode: "insensitive" } },
-                { architecture: { contains: query.search, mode: "insensitive" } },
-              ],
-            },
-          },
-        },
-      ],
     });
   }
 
@@ -318,6 +296,22 @@ const serializeRunner = (runner: RunnerListRecord) => ({
   activeSessionCount: runner._count.sessions,
 });
 
+const matchesRunnerSearch = (runner: ReturnType<typeof serializeRunner>, search: string | undefined) => {
+  if (!search) {
+    return true;
+  }
+
+  return (
+    includesSearch(runner.name, search) ||
+    includesSearch(runner.machineName, search) ||
+    includesSearch(runner.hostname, search) ||
+    includesSearch(runner.os, search) ||
+    includesSearch(runner.architecture, search) ||
+    includesSearch(runner.environment, search) ||
+    runner.labels.some((label) => includesSearch(label, search))
+  );
+};
+
 const serializeSession = (session: SessionListRecord) => ({
   id: session.id,
   runnerId: session.runnerId,
@@ -355,11 +349,15 @@ const listFilteredRunners = async (query: {
   const runners = await prisma.runner.findMany({
     where: buildRunnerListWhere(query),
     orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
-    ...(query.limit ? { take: query.limit } : {}),
+    ...(query.limit && !query.search ? { take: query.limit } : {}),
     include: runnerListInclude,
   });
 
-  return runners.map((runner) => serializeRunner(runner as RunnerListRecord));
+  const serializedRunners = runners.map((runner) => serializeRunner(runner as RunnerListRecord));
+
+  return serializedRunners
+    .filter((runner) => matchesRunnerSearch(runner, query.search))
+    .slice(0, query.limit ?? serializedRunners.length);
 };
 
 const normalizePositiveInteger = (value: unknown) => {
@@ -744,6 +742,15 @@ export const registerV1Routes = async (app: any) => {
   });
 
   app.post("/v1/runners/:id/revoke-tokens", async (request: any, reply: any) => {
+    const adminAuth = authenticateAdminRequest(request.headers.authorization);
+    if (adminAuth === "unconfigured") {
+      return reply.code(503).send({ error: "Control node admin token is not configured" });
+    }
+
+    if (adminAuth !== "ok") {
+      return reply.code(401).send({ error: "Unauthorized" });
+    }
+
     const params = z.object({ id: z.string().min(1) }).parse(request.params);
     const revokedAt = new Date();
     const result = await prisma.$transaction(async (tx) => {

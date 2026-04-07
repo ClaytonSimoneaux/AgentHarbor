@@ -261,6 +261,8 @@ const enrollDemoRunner = async ({
     labels: buildDemoRunnerLabels({
       platform: os.platform(),
       runnerIndex,
+      scenario,
+      agentType,
     }),
     environment: "demo",
     machine: {

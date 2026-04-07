@@ -11,6 +11,8 @@ if (!databaseUrl) {
   process.env.NODE_ENV = "test";
   process.env.CONTROL_NODE_TLS_ENABLED = "false";
   process.env.DATABASE_URL = databaseUrl;
+  const controlNodeAdminToken = "integration-control-admin-token";
+  process.env.CONTROL_NODE_ADMIN_TOKEN = controlNodeAdminToken;
 
   const [{ buildServer }, { prisma }, { hashToken }] = await Promise.all([
     import("../server.js"),
@@ -226,21 +228,9 @@ if (!databaseUrl) {
   test("groups filtered runners by label with online and active-session rollups", async () => {
     const alphaEnrollment = await enrollRunner("backend-group-alpha");
     const betaEnrollment = await enrollRunner("backend-group-beta");
-
-    const frontendEnrollment = await app.inject({
-      method: "POST",
-      url: "/v1/enroll",
-      payload: {
-        runnerName: "frontend-group-runner",
-        labels: ["demo", "frontend", "student-team-b"],
-        environment: "demo",
-        machine: {
-          ...baseMachine,
-          hostname: `${baseMachine.hostname}-frontend-group-runner`,
-        },
-      },
+    const frontendEnrollment = await enrollRunner("frontend-group-runner", {
+      labels: ["demo", "frontend", "student-team-b"],
     });
-    assert.equal(frontendEnrollment.statusCode, 200);
 
     const alphaHeartbeat = await app.inject({
       method: "POST",
@@ -335,6 +325,23 @@ if (!databaseUrl) {
     assert.equal(frontendGroups[0]?.label, "frontend");
     assert.equal(frontendGroups[0]?.runnerCount, 1);
     assert.deepEqual(frontendGroups[0]?.runners.map((runner) => runner.name), ["frontend-group-runner"]);
+
+    const partialSearchResponse = await app.inject({
+      method: "GET",
+      url: "/v1/runners?search=student",
+    });
+    assert.equal(partialSearchResponse.statusCode, 200);
+    const partialSearchRunners = partialSearchResponse.json() as Array<{ id: string }>;
+    assert.equal(partialSearchRunners.length, 1);
+    assert.equal(partialSearchRunners[0]?.id, frontendEnrollment.runner.id);
+
+    const partialGroupSearchResponse = await app.inject({
+      method: "GET",
+      url: "/v1/runners/groups?search=student",
+    });
+    assert.equal(partialGroupSearchResponse.statusCode, 200);
+    const partialGroupSearch = partialGroupSearchResponse.json() as Array<{ label: string }>;
+    assert.equal(partialGroupSearch.some((group) => group.label === "student-team-b"), true);
   });
 
   test("revokes active runner tokens and rejects future heartbeat and telemetry", async () => {
@@ -357,9 +364,18 @@ if (!databaseUrl) {
       ],
     });
 
+    const unauthorizedRevokeResponse = await app.inject({
+      method: "POST",
+      url: `/v1/runners/${enrollment.runner.id}/revoke-tokens`,
+    });
+    assert.equal(unauthorizedRevokeResponse.statusCode, 401);
+
     const revokeResponse = await app.inject({
       method: "POST",
       url: `/v1/runners/${enrollment.runner.id}/revoke-tokens`,
+      headers: {
+        authorization: `Bearer ${controlNodeAdminToken}`,
+      },
     });
 
     assert.equal(revokeResponse.statusCode, 200);
@@ -411,6 +427,9 @@ if (!databaseUrl) {
     const missingRunnerResponse = await app.inject({
       method: "POST",
       url: "/v1/runners/missing-runner/revoke-tokens",
+      headers: {
+        authorization: `Bearer ${controlNodeAdminToken}`,
+      },
     });
     assert.equal(missingRunnerResponse.statusCode, 404);
   });
